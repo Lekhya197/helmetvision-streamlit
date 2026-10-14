@@ -9,6 +9,7 @@ the access code is entered in that session.
 """
 import hashlib
 import os
+import pathlib
 import shutil
 import sys
 import tempfile
@@ -16,28 +17,47 @@ import time
 import traceback
 import uuid
 
+import numpy as np
 import streamlit as st
 
+import diagnostics
 import onnx_utils
 from live_component import helmet_live
 import processing as proc
 import telegram_alerts
 from processing import UploadError
 
-st.set_page_config(page_title="HelmetVision demo", page_icon="⛑️", layout="wide")
+APP_DIR = pathlib.Path(__file__).resolve().parent
 
 
 @st.cache_resource(show_spinner="Loading the model...")
 def load_detector():
-    return onnx_utils.OnnxDetector(threads=2)
+    return onnx_utils.OnnxDetector(threads=2)  # model/ next to onnx_utils.py, not the working directory
 
 
 def get_detector():
     try:
         return load_detector()
-    except Exception as e:
-        print(f"[app] model load failed: {type(e).__name__}: {e}", file=sys.stderr)
+    except Exception as e:  # the cause goes to the server log; visitors get the short message
+        print(f"[app] model load failed: {diagnostics.short_error(e)}", file=sys.stderr)
         raise UploadError("The model could not be loaded. Please try again later.") from None
+
+
+@st.cache_resource(show_spinner=False)
+def startup_check():
+    """Once per server process: log the versions and a model self-test (load plus one inference)."""
+    v = diagnostics.versions()
+    try:
+        load_detector().detect(np.full((onnx_utils.IMGSZ, onnx_utils.IMGSZ, 3), 114, np.uint8))
+        model = {"ok": True, "error_type": None, "text": "ok"}
+    except Exception as e:
+        model = {"ok": False, "error_type": type(e).__name__, "text": f"FAILED {diagnostics.short_error(e)}"}
+    print(f"[app] python {v['python']}, streamlit {v['streamlit']}, onnxruntime {v['onnxruntime']}; "
+          f"model self-test: {model['text']}", file=sys.stderr)
+    mismatches = diagnostics.pin_mismatches(APP_DIR / "requirements.txt")
+    if mismatches:
+        print("[app] not the versions pinned in requirements.txt: " + "; ".join(mismatches), file=sys.stderr)
+    return {"versions": v, "model": model}
 
 
 def friendly(fn):
@@ -79,12 +99,9 @@ def photo_tab():
 
     def work():
         proc.check_upload(f.name, f.size, proc.PHOTO_TYPES, proc.PHOTO_MAX_BYTES)
-        annotated, dets = show_photo(f.getvalue())
-        if tg_owner() and st.button("Send this result to Telegram", key="photo_send"):
-            bad = proc.violations(dets)
-            caption = (alert_caption("photo", max(d.conf for d in bad)) if bad
-                       else f"Hosted demo - photo: no no_helmet alert ({len(dets)} heads)")
-            tg_status(tg_send(caption, proc.small_jpeg(annotated[:, :, ::-1])))
+        data = f.getvalue()
+        annotated, dets = show_photo(data)
+        picture_alert("photo", "photo", data, annotated, dets)
     friendly(work)
 
 
@@ -116,28 +133,33 @@ def run_video(f):
                 pass
 
 
-def show_video_result(r):
+def show_video_result(r, tg_line=None):
     cols = st.columns(4)
     cols[0].metric("Alerts", len(r["alerts"]))
     cols[1].metric("Tracks", r["tracks"])
     cols[2].metric("Frames checked", r["frames"])
     cols[3].metric("Video length", f"{r['duration']:.1f} s")
     st.caption(f"Sampled at about {r['sample_fps']} frames per second. An alert needs no_helmet "
-               f"(confidence 0.60 or more) on the same track in 5 of its last 8 sampled frames; each "
-               f"track then waits 60 s of video time before it can alert again.")
+               f"(confidence {proc.ALERT_CONF:.2f} or more) on the same track in {proc.VIDEO_MIN_HITS} of "
+               f"its last {proc.VIDEO_WINDOW} sampled frames (about one second); each track then waits "
+               f"60 s of video time before it can alert again.")
     st.subheader("Alert timeline")
     if r["alerts"]:
         st.dataframe([{"time": a["time"], "track": a["track"], "confidence": a["conf"]}
                       for a in r["alerts"]], hide_index=True)
+        tg_status(tg_line)
     else:
         st.info("No alerts in this video.")
+        if r.get("unconfirmed"):
+            st.info(f"no_helmet was seen, but brief detections not confirmed; need {proc.VIDEO_MIN_HITS} "
+                    f"hits in {proc.VIDEO_WINDOW} sampled frames.")
+        if TG is not None:
+            st.caption("No violation confirmed - nothing sent")
     if r["suppressed"]:
         st.caption(f"{len(r['suppressed'])} repeat alert(s) suppressed (same spot, new track id): "
                    + ", ".join(f"{s['time']} #{s['track']}" for s in r["suppressed"]))
     if r["gallery"]:
         st.subheader("Alert frames")
-        for line in r.get("tg") or []:
-            tg_status(line)
         st.image([g[0] for g in r["gallery"]], caption=[g[1] for g in r["gallery"]], width=320)
     st.subheader("Annotated video")
     if r.get("video_bytes"):
@@ -156,14 +178,12 @@ def video_tab():
     def work():
         proc.check_upload(f.name, f.size, proc.VIDEO_TYPES, proc.VIDEO_MAX_BYTES)
         cache = st.session_state.get("video_result")
-        file_key = getattr(f, "file_id", None) or (f.name, f.size)
-        if not cache or cache[0] != file_key:
+        digest = hashlib.sha256(f.getvalue()).hexdigest()
+        if not cache or cache[0] != digest:
             st.session_state.pop("video_result", None)
-            result = run_video(f)
-            if tg_alerts_on():  # only when the alerts fire, i.e. once per processed upload
-                result["tg"] = send_video_alerts(result)
-            st.session_state["video_result"] = (file_key, result)
-        show_video_result(st.session_state["video_result"][1])
+            st.session_state["video_result"] = (digest, run_video(f))
+        result = st.session_state["video_result"][1]
+        show_video_result(result, video_alert(digest, result))
     friendly(work)
 
 
@@ -177,16 +197,7 @@ def camera_tab():
     def work():
         data = shot.getvalue()
         annotated, dets = show_photo(data)
-        bad = proc.violations(dets)
-        if not bad or TG is None:
-            return
-        # each snapshot is decided once, when it is first shown; reruns only repeat the status
-        key = "camera:" + hashlib.sha256(data).hexdigest()
-        done = st.session_state.setdefault("tg_done", {})
-        if key not in done:
-            done[key] = (tg_send(alert_caption("camera snapshot", max(d.conf for d in bad)),
-                                 proc.small_jpeg(annotated[:, :, ::-1])) if tg_alerts_on() else None)
-        tg_status(done[key])
+        picture_alert("camera", "camera snapshot", data, annotated, dets)
     friendly(work)
 
 
@@ -194,23 +205,51 @@ def camera_tab():
 TG_KEYS = ("TG_TOKEN", "TG_CHAT", "ALERT_ACCESS_CODE")
 
 
+def secret_value(name):
+    return st.secrets.get(name)  # raises when there is no secrets file at all
+
+
 def tg_config():
     """The three Telegram secrets from st.secrets, or None when any is missing; the whole section is
-    then hidden. The values are never shown, logged or printed."""
-    try:
-        cfg = {k: st.secrets.get(k) for k in TG_KEYS}
-    except Exception:  # no secrets file at all, or an unreadable one
+    then hidden and only the missing NAMES are logged. Values are never shown, logged or printed."""
+    present = diagnostics.presence(TG_KEYS, secret_value)
+    missing = tuple(k for k in TG_KEYS if not present[k])
+    if missing:
+        log_missing_secrets(missing)
         return None
-    if not all(isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip()
-               for v in cfg.values()):
-        return None
-    return {k: str(v).strip() for k, v in cfg.items()}
+    return {k: str(secret_value(k)).strip() for k in TG_KEYS}
 
 
-@st.cache_resource
-def tg_limiter():
-    """One RateLimiter shared by all sessions of this app process."""
-    return telegram_alerts.RateLimiter()
+@st.cache_resource(show_spinner=False)
+def log_missing_secrets(names):
+    """Once per process and set of names."""
+    print(f"[app] Telegram alerts off: missing secret(s) {', '.join(names)}", file=sys.stderr)
+
+
+# Optional secrets: (name, default, lowest, highest). Values out of range fall back to the default.
+TG_LIMIT_KEYS = (("TG_MAX_PER_HOUR", 10, 1, 1000), ("TG_COOLDOWN_SECONDS", 60, 5, 3600))
+PICTURE_COOLDOWN = 5.0  # Photo and Camera snapshot; Live, Video and the test message use TG_COOLDOWN_SECONDS
+
+
+def tg_limits():
+    """{name: int} for TG_LIMIT_KEYS from st.secrets; an invalid value is logged by NAME only."""
+    out = {}
+    for name, default, lo, hi in TG_LIMIT_KEYS:
+        out[name], ok = telegram_alerts.limit_setting(secret_value(name), default, lo, hi)
+        if not ok:
+            log_bad_limit(name, default, lo, hi)
+    return out
+
+
+@st.cache_resource(show_spinner=False)
+def log_bad_limit(name, default, lo, hi):
+    print(f"[app] {name} is not a whole number from {lo} to {hi}; using {default}", file=sys.stderr)
+
+
+@st.cache_resource(show_spinner=False)
+def tg_limiter(hourly_cap, cooldown):
+    """One RateLimiter shared by all sessions of this app process (a new one if the settings change)."""
+    return telegram_alerts.RateLimiter(cooldown=float(cooldown), hourly_cap=hourly_cap)
 
 
 def tg_owner():
@@ -226,39 +265,108 @@ def alert_caption(where, conf):
     return f"No helmet - hosted demo - {where} conf {conf:.2f}"
 
 
-def tg_send(caption, jpeg=None):
-    """Send through the shared rate limiter in owner mode; returns the status line for tg_status."""
+def tg_decided(key, decide):
+    """The status stored for `key` in this session, calling decide() only the first time, so Streamlit
+    reruns never send twice."""
+    done = st.session_state.setdefault("tg_done", {})
+    if key not in done:
+        done[key] = decide()
+        while len(done) > 200:
+            done.pop(next(iter(done)))
+    return done[key]
+
+
+def auto_send(caption, jpeg, channel):
+    """An automatic alert: sent only in owner mode with the toggle on; otherwise the reason."""
+    if not tg_owner():
+        return "Telegram: locked"
+    if not tg_alerts_on():
+        return "Telegram: toggle is off"
+    return tg_send(caption, jpeg, channel=channel)
+
+
+def picture_alert(kind, where, data, annotated, dets):
+    """Photo and Camera snapshot: one automatic alert per new picture (SHA-256 of its bytes) when it
+    has a no_helmet detection at ALERT_CONF or more, then its status and, in owner mode, "Send again"."""
+    if TG is None:
+        return
+    bad = proc.violations(dets)
+    caption = proc.violation_caption(where, bad) if bad else None
+    status = tg_decided(f"{kind}:" + hashlib.sha256(data).hexdigest(),
+                        lambda: auto_send(caption, proc.small_jpeg(annotated[:, :, ::-1]), kind) if bad else None)
+    if bad:
+        tg_status(status)
+    else:
+        st.info("No violation detected - nothing sent")
+    if tg_owner() and st.button("Send again", key=f"{kind}_send"):
+        tg_status(tg_send(caption or f"Hosted demo - {where}: no no_helmet alert ({len(dets)} heads)",
+                          proc.small_jpeg(annotated[:, :, ::-1]), channel=kind))
+
+
+def tg_send(caption, jpeg=None, sent_text="Telegram: sent", channel="test"):
+    """Send through the shared rate limiter in owner mode; returns the status line for tg_status.
+    Each session has its own cooldown per channel: PICTURE_COOLDOWN for "photo" and "camera",
+    TG_COOLDOWN_SECONDS for "live", "video" and "test"; TG_MAX_PER_HOUR is global."""
     if not tg_owner():
         return None
-    ok, why = tg_limiter().acquire(st.session_state.setdefault("tg_sid", uuid.uuid4().hex))
+    limits = tg_limits()
+    cooldown = PICTURE_COOLDOWN if channel in ("photo", "camera") else limits["TG_COOLDOWN_SECONDS"]
+    sid = st.session_state.setdefault("tg_sid", uuid.uuid4().hex)
+    ok, why = tg_limiter(limits["TG_MAX_PER_HOUR"], limits["TG_COOLDOWN_SECONDS"]).acquire(
+        f"{sid}:{channel}", cooldown=cooldown)
     if not ok:
         return f"Telegram: rate limited ({why})"
     if not st.session_state.get("tg_photo", True):
         jpeg = None
     with st.spinner("Sending to Telegram..."):
         sent, msg = telegram_alerts.send_alert(TG["TG_TOKEN"], TG["TG_CHAT"], caption, jpeg)
-    return "Telegram: alert sent" if sent else f"Telegram: send failed ({msg})"
+    return sent_text if sent else f"Telegram: send failed ({msg})"
 
 
 def tg_status(line):
     if not line:
         return
-    if line.endswith("alert sent"):
+    if line.endswith("sent"):
         st.success(line)
     elif "rate limited" in line:
         st.warning(line)
+    elif line.endswith(("toggle is off", "locked")):
+        st.info(line)
     else:
         st.error(line)
 
 
-def send_video_alerts(r):
-    """One Telegram attempt per alert frame; returns the status lines (most hit the rate limiter)."""
-    lines = []
-    for (jpeg, _), meta in zip(r["gallery"], r["gallery_meta"]):
-        status = tg_send(alert_caption(f"video t={meta['t']:.1f}s", meta["conf"]),
-                         proc.small_jpeg(proc.decode_image(jpeg)))
-        lines.append(f"{meta['time']} {status}")
-    return lines
+def tg_state_caption():
+    """Above the tabs, only when Telegram is configured: locked, ON or OFF for this session."""
+    if TG is None:
+        return
+    if not tg_owner():
+        st.caption("Telegram alerts: locked (owner access code in the sidebar)")
+    else:
+        st.caption(f"Telegram alerts: {'ON' if tg_alerts_on() else 'OFF'}")
+
+
+def diagnostics_panel():
+    """Local debugging only (HELMET_DEBUG=1): versions, model status and which secret names exist."""
+    if os.environ.get("HELMET_DEBUG") != "1":
+        return
+    v, model = STARTUP["versions"], STARTUP["model"]
+    with st.expander("Diagnostics"):
+        st.markdown("\n".join([
+            f"- python {v['python']}, streamlit {v['streamlit']}, onnxruntime {v['onnxruntime']}",
+            "- model self-test at startup: " + ("ok" if model["ok"] else f"FAILED ({model['error_type']})"),
+            *(f"- secret {k}: {'present' if ok else 'missing'}"
+              for k, ok in diagnostics.presence(TG_KEYS, secret_value).items()),
+        ]))
+
+
+def video_alert(digest, r):
+    """ONE automatic alert per uploaded video (SHA-256 of the file), after the whole video is
+    processed: the frame of the highest-confidence alert, captioned with every alert's timestamp."""
+    if TG is None or not r["alerts"]:
+        return None
+    return tg_decided("video:" + digest, lambda: auto_send(
+        proc.video_caption(r["alerts"]), proc.small_jpeg(proc.decode_image(r["best"]["jpeg"])), "video"))
 
 
 def check_code():
@@ -284,6 +392,10 @@ def owner_section():
     if tg_owner():
         st.sidebar.toggle("Send alerts to Telegram", value=False, key="tg_on")
         st.sidebar.checkbox("Include photo", value=True, key="tg_photo")
+        if st.sidebar.button("Send test message", key="tg_test"):
+            line = tg_send("HelmetVision hosted demo: test message", None, sent_text="Telegram: sent")
+            with st.sidebar:
+                tg_status(line)
         st.sidebar.button("Lock", key="tg_lock", on_click=lock_owner_mode)
         return
     guard = st.session_state.get("tg_guard")
@@ -303,9 +415,16 @@ def live_tab():
                "onnxruntime-web (WebGPU if available, otherwise WebAssembly). No video is uploaded and "
                "nothing is stored. Speed depends on your device. Needs HTTPS or localhost and camera "
                "permission.")
-    value = helmet_live(key="live", report_alerts=tg_alerts_on())
-    if TG is not None:
-        handle_live_event(value)
+    # Alerts leave the browser only for the owner: events once unlocked (so "toggle is off" can be
+    # shown), thumbnails only with the toggle and Include photo on. Visitors' pages send nothing.
+    value = helmet_live(key="live", report_alerts=tg_owner(),
+                        include_thumb=tg_alerts_on() and bool(st.session_state.get("tg_photo", True)))
+    if TG is None:
+        return
+    if not tg_owner():
+        tg_status("Telegram: locked")
+        st.caption("Live alerts are not reported until the owner enters the access code in the sidebar.")
+    handle_live_event(value)
 
 
 def handle_live_event(value):
@@ -314,13 +433,20 @@ def handle_live_event(value):
     if ev is None:
         return
     seen = st.session_state.setdefault("tg_live_seen", {})  # event id -> status line
+    when = time.strftime("%H:%M:%S UTC", time.gmtime(ev["ts"] / 1000)) if ev["ts"] else "time unknown"
     if ev["id"] not in seen:
-        when = time.strftime(" at %H:%M:%S UTC", time.gmtime(ev["ts"] / 1000)) if ev["ts"] else ""
-        seen[ev["id"]] = (tg_send(alert_caption("live camera", ev["conf"]) + when, ev["jpeg"])
-                          if tg_alerts_on() else None)
+        if not tg_owner():
+            line = "Telegram: locked"
+        elif not tg_alerts_on():
+            line = "Telegram: toggle is off"
+        else:
+            line = tg_send(f"{alert_caption('live camera', ev['conf'])} at {when}", ev["jpeg"],
+                           channel="live")
+        seen[ev["id"]] = line
         while len(seen) > 200:
             seen.pop(next(iter(seen)))
     tg_status(seen[ev["id"]])
+    st.caption(f"Last Live alert: {when}, conf {ev['conf']:.2f}")
 
 
 def about_tab():
@@ -329,14 +455,14 @@ def about_tab():
 It uses a small YOLO26n detector trained on public helmet datasets, exported to ONNX.
 
 - **Live**: continuous detection from your camera. The model runs in your browser with
-  onnxruntime-web, using the same tracker and alert rules as the Video tab, with a banner and a beep
-  when an alert fires.
+  onnxruntime-web, with the same tracker as the Video tab and the edge device's alert rule (5 of the
+  last 8 frames), and a banner and a beep when an alert fires.
 - **Photo** and **Camera snapshot**: one detection pass, boxes drawn green (`helmet_on`) or red
   (`no_helmet`) with their confidence.
-- **Video**: about 3 frames per second go through the detector, a simple box tracker and the same
-  alert rules as the edge device: an alert needs `no_helmet` (confidence 0.60 or more) on one tracked
-  head in 5 of its last 8 sampled frames, with a 60 s cooldown per track and suppression of repeats
-  when a head gets a new track id.
+- **Video**: about 3 frames per second go through the detector, a simple box tracker and the
+  edge device's alert rules with a shorter window for the sampled frames: an alert needs `no_helmet`
+  (confidence 0.60 or more) on one tracked head in 3 of its last 5 sampled frames (about one second),
+  with a 60 s cooldown per track and suppression of repeats when a head gets a new track id.
 
 **Privacy.** The **Live** tab processes the camera video in your browser and uploads nothing; its
 alert log lives only in the open page. The **Photo**, **Video** and **Camera snapshot** tabs are
@@ -354,10 +480,16 @@ decisions.
 
 
 TG = tg_config()
+# expanded so the owner finds the access code; without Telegram secrets there is no sidebar at all
+st.set_page_config(page_title="HelmetVision demo", page_icon="⛑️", layout="wide",
+                   initial_sidebar_state="expanded" if TG is not None else "auto")
+STARTUP = startup_check()
 if TG is not None:
     owner_section()
 st.title("⛑️ HelmetVision demo")
 st.caption("Helmet detection with ONNX Runtime, live in your browser or on uploads. A demo, not a safety system.")
+tg_state_caption()
+diagnostics_panel()
 live, photo, video, camera, about = st.tabs(["Live", "Photo", "Video", "Camera snapshot", "About"])
 with live:
     live_tab()

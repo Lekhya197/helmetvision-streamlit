@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from tracker import IoUTracker
-from voting import AlertSuppressor, Tracked, ViolationVoter, decide, is_violation
+from voting import VIOLATION_CONF, AlertSuppressor, Tracked, ViolationVoter, decide, is_violation
 
 PHOTO_TYPES = ("jpg", "jpeg", "png", "webp")
 PHOTO_MAX_BYTES = 8 * 1024 * 1024
@@ -20,6 +20,11 @@ SAMPLE_FPS = 3.0
 VIDEO_LONG_SIDE = 960  # frames are downscaled to this before drawing and encoding
 MAX_GALLERY = 20  # annotated alert frames kept in memory
 TELEGRAM_LONG_SIDE = 800
+ALERT_CONF = VIOLATION_CONF  # 0.60: a no_helmet detection at or above this is an alert
+# Video tab voter: about 3 sampled frames per second, so 3 of the last 5 is about one second. The Live
+# tab (live_component/frontend/lib/voter.js) and the edge device keep 5 of 8.
+VIDEO_WINDOW = 5
+VIDEO_MIN_HITS = 3
 
 COLORS = {"helmet_on": (0, 200, 0), "no_helmet": (0, 0, 230)}  # BGR by class name
 OTHER_COLOR = (0, 200, 230)
@@ -92,6 +97,20 @@ def violations(dets):
     return [d for d in dets if is_violation(d.name, d.conf)]
 
 
+def violation_caption(where, bad):
+    """Telegram caption for the no_helmet detections `bad` (non-empty) in one picture."""
+    return (f"No helmet - hosted demo - {where} - {len(bad)} without helmet "
+            f"(best {max(d.conf for d in bad):.2f})")
+
+
+def video_caption(alerts):
+    """Telegram caption for all of a video's alerts (non-empty), with their video timestamps."""
+    times = sorted({a["t"] for a in alerts})
+    n = len(alerts)
+    return (f"No helmet - hosted demo - video - {n} violation{'s' if n != 1 else ''} at "
+            + ", ".join(f"t={t:.1f}s" if i == 0 else f"{t:.1f}s" for i, t in enumerate(times)))
+
+
 def small_jpeg(img_bgr, long_side=TELEGRAM_LONG_SIDE, quality=85):
     """JPEG bytes of img_bgr fitted into long_side (never upscaled)."""
     h, w = img_bgr.shape[:2]
@@ -137,13 +156,15 @@ def video_duration(cap):
 
 
 def process_video(path, detector, out_path=None, progress=None):
-    """Sample about SAMPLE_FPS frames per second through detector, tracker, voter and suppressor.
+    """Sample about SAMPLE_FPS frames per second through detector, tracker, voter (VIDEO_MIN_HITS of
+    VIDEO_WINDOW) and suppressor.
 
     Frames are read one at a time from `path`. Video time drives the voter cooldown and the suppressor.
     Returns a dict: alerts [{t, time, track, conf}], suppressed [{t, time, track}], gallery
-    [(JPEG bytes, caption)] of up to MAX_GALLERY annotated alert frames, gallery_meta [{t, time, conf}]
-    (one per gallery frame; conf is the highest of the alerts fired in it), frames, tracks, duration,
-    sample_fps, video (out_path or None) and note (why there is no video, or None).
+    [(JPEG bytes, caption)] of up to MAX_GALLERY annotated alert frames, best (the annotated frame of
+    the highest-confidence alert as {t, time, conf, jpeg}, or None), unconfirmed (tracks with at least
+    one no_helmet vote that never fired or were suppressed), frames, tracks, duration, sample_fps,
+    video (out_path or None) and note (why there is no video, or None).
     progress(fraction, text) is called after each sampled frame.
     """
     cap = cv2.VideoCapture(path)
@@ -157,8 +178,10 @@ def process_video(path, detector, out_path=None, progress=None):
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps = fps if 1 <= fps <= 240 else 30.0
         step = max(1, round(fps / SAMPLE_FPS))
-        tracker, voter, suppressor = IoUTracker(), ViolationVoter(), AlertSuppressor()
-        alerts, suppressed, gallery, gallery_meta, track_ids = [], [], [], [], set()
+        tracker, suppressor = IoUTracker(), AlertSuppressor()
+        voter = ViolationVoter(window=VIDEO_WINDOW, min_hits=VIDEO_MIN_HITS)
+        alerts, suppressed, gallery, track_ids = [], [], [], set()
+        voted, decided, best = set(), set(), None
         note = None if out_path else "No annotated video was requested."
         idx = frames = 0
         while True:
@@ -179,6 +202,8 @@ def process_video(path, detector, out_path=None, progress=None):
             track_ids.update(ids)
             tracked = [Tracked(i, d.box, d.conf, d.name) for i, d in zip(ids, dets)]
             decision = decide(tracked, voter, suppressor, now=t)
+            voted.update(x.track_id for x in tracked if is_violation(x.name, x.conf))
+            decided.update(x.track_id for x in decision.fired + decision.suppressed)
             draw(frame, dets, ids)
             for a in decision.fired:
                 alerts.append({"t": round(t, 2), "time": fmt_time(t), "track": a.track_id,
@@ -187,11 +212,12 @@ def process_video(path, detector, out_path=None, progress=None):
                 suppressed.append({"t": round(t, 2), "time": fmt_time(t), "track": s.track_id})
             if decision.fired:
                 banner(frame, f"ALERT {fmt_time(t)}  #" + " #".join(str(a.track_id) for a in decision.fired))
+                jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
                 if len(gallery) < MAX_GALLERY:
-                    gallery.append((cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes(),
-                                    f"{fmt_time(t)} track " + ", ".join(f"#{a.track_id}" for a in decision.fired)))
-                    gallery_meta.append({"t": round(t, 2), "time": fmt_time(t),
-                                         "conf": round(max(a.conf for a in decision.fired), 3)})
+                    gallery.append((jpeg, f"{fmt_time(t)} track " + ", ".join(f"#{a.track_id}" for a in decision.fired)))
+                conf = max(a.conf for a in decision.fired)
+                if best is None or conf > best["conf"]:
+                    best = {"t": round(t, 2), "time": fmt_time(t), "conf": round(conf, 3), "jpeg": jpeg}
             if out_path and gen is None and note is None:
                 h, w = frame.shape[:2]
                 gen, note = open_h264_writer(out_path, (w, h), fps / step)
@@ -208,7 +234,7 @@ def process_video(path, detector, out_path=None, progress=None):
         cap.release()
         if gen is not None:
             gen.close()
-    return {"alerts": alerts, "suppressed": suppressed, "gallery": gallery, "gallery_meta": gallery_meta,
-            "frames": frames,
+    return {"alerts": alerts, "suppressed": suppressed, "gallery": gallery, "best": best,
+            "unconfirmed": len(voted - decided), "frames": frames,
             "tracks": len(track_ids), "duration": round(idx / fps, 2), "sample_fps": round(fps / step, 2),
             "video": out_path if gen is not None else None, "note": note}

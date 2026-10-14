@@ -1,8 +1,9 @@
 // Live camera tab: getUserMedia -> in-browser detector -> tracker -> voter/suppressor -> canvas, banner,
 // beep and an alert log. Nothing is uploaded or stored. Talks to Streamlit with a hand-written minimal
 // component handshake (componentReady + setFrameHeight); render messages give the theme and
-// args.report_alerts. Only when report_alerts is true (owner mode with the Telegram toggle on) does an
-// alert go to Python with setComponentValue: {id, conf, ts, thumb_jpeg_base64} (320 px, <= ~40 KB).
+// args.report_alerts and args.include_thumb. Only when report_alerts is true (owner mode) does an alert
+// go to Python with setComponentValue: {id, conf, ts, thumb_jpeg_base64}; the thumbnail (320 px,
+// <= ~40 KB) only when include_thumb is true (Telegram toggle and Include photo on), otherwise null.
 import { Detector, ORT_VERSION } from "./lib/detector.js";
 import { alertEvent, componentValueMessage, eventId, smallJpegBase64, thumbSize } from "./lib/report.js";
 import { IoUTracker } from "./lib/tracker.js";
@@ -24,6 +25,7 @@ const ctx = els.view.getContext("2d");
 
 // ---- Streamlit handshake ----
 let reportAlerts = false; // false for visitors: then nothing is ever sent to Python
+let includeThumb = false;
 function post(type, extra = {}) {
   window.parent.postMessage({ isStreamlitMessage: true, type, ...extra }, "*");
 }
@@ -40,6 +42,7 @@ window.addEventListener("message", (ev) => {
   if (!d || d.type !== "streamlit:render") return; // everything else is ignored
   if (d.theme) applyTheme(d.theme);
   reportAlerts = d.args?.report_alerts === true;
+  includeThumb = reportAlerts && d.args?.include_thumb === true;
   post("streamlit:setFrameHeight", { height: FRAME_HEIGHT });
 });
 post("streamlit:componentReady", { apiVersion: 1 });
@@ -279,16 +282,21 @@ function addAlert(t) {
   reportAlert(t);
 }
 
-// Owner mode only: send the alert to Python, which forwards it to Telegram under its rate limiter.
+// Owner mode only: send the alert to Python, which shows its Telegram status and, with the toggle on,
+// forwards it to Telegram under its rate limiter.
+function makeThumb() {
+  const [w, h] = thumbSize(els.view.width, els.view.height);
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  c.getContext("2d").drawImage(els.view, 0, 0, w, h); // the frame with its boxes, drawn in handle()
+  return smallJpegBase64((q) => c.toDataURL("image/jpeg", q));
+}
+
 function reportAlert(t) {
   if (!reportAlerts) return;
   try {
-    const [w, h] = thumbSize(els.view.width, els.view.height);
-    const c = document.createElement("canvas");
-    c.width = w;
-    c.height = h;
-    c.getContext("2d").drawImage(els.view, 0, 0, w, h); // the frame with its boxes, drawn in handle()
-    const thumb = smallJpegBase64((q) => c.toDataURL("image/jpeg", q));
+    const thumb = includeThumb ? makeThumb() : null;
     const value = alertEvent({ id: eventId(), conf: t.conf, ts: Date.now(), thumb });
     window.parent.postMessage(componentValueMessage(value), "*");
   } catch (e) {

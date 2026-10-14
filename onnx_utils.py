@@ -128,8 +128,14 @@ def load_classes(path):
 class OnnxDetector:
     """One onnxruntime CPU session; detect() returns Detections sorted by confidence."""
 
-    def __init__(self, model_path=MODEL_DIR / "helmet.onnx", classes_path=MODEL_DIR / "classes.json",
-                 threads=2):
+    def __init__(self, model_path=None, classes_path=None, threads=2):
+        """Defaults: model/helmet.onnx and model/classes.json next to this file, whatever the working
+        directory. onnxruntime is imported here, so a missing install fails at load, not at import."""
+        model_path = pathlib.Path(model_path or MODEL_DIR / "helmet.onnx")
+        classes_path = pathlib.Path(classes_path or MODEL_DIR / "classes.json")
+        for p in (model_path, classes_path):
+            if not p.is_file():
+                raise FileNotFoundError(f"missing model file {p.name} in {p.parent}")
         import onnxruntime as ort
         self.names = load_classes(classes_path)
         opts = ort.SessionOptions()

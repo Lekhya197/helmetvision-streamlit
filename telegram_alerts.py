@@ -2,13 +2,14 @@
 
 send_alert() posts one message (sendPhoto with a JPEG, or sendMessage without) and never raises. The
 bot token is part of the API URL, so every message this module returns or logs is masked first, and
-exceptions from requests are never re-raised or logged as is. RateLimiter (per-session cooldown plus a
+exceptions from requests are never re-raised or logged as is. RateLimiter (per-key cooldown plus a
 global hourly cap) and AttemptGuard (wrong access codes) take an injectable clock for tests.
 parse_live_event() validates the alert events the Live component sends in owner mode.
 """
 import base64
 import binascii
 import hmac
+import json
 import logging
 import re
 import threading
@@ -65,7 +66,7 @@ def send_alert(token, chat, caption, jpeg_bytes=None, *, post=None, sleep=time.s
                 return False, msg
             if resp.status_code == 200:
                 return True, "sent"
-            msg = mask(f"HTTP {resp.status_code}: {str(resp.text)[:200]}", token)
+            msg = mask(f"HTTP {resp.status_code}" + (f": {desc}" if (desc := description(resp)) else ""), token)
             log.warning("telegram returned %s", msg)
             return False, msg
     except Exception as e:  # anything else: only the type name and masked text, never a traceback
@@ -75,36 +76,61 @@ def send_alert(token, chat, caption, jpeg_bytes=None, *, post=None, sleep=time.s
     return False, "failed"
 
 
+def description(resp):
+    """Telegram's error description from a JSON reply ({"ok": false, "description": ...}), or ""; the
+    raw body is never returned."""
+    try:
+        d = json.loads(resp.text).get("description")
+    except Exception:
+        return ""
+    return str(d)[:200] if d else ""
+
+
 class RateLimiter:
-    """At most one send per `cooldown` seconds per session and `hourly_cap` sends per hour overall.
+    """At most one send per cooldown per key (a session, or a session and a tab) and `hourly_cap`
+    sends per hour overall.
 
     Thread-safe; one instance is shared by all sessions. acquire() claims a slot before the send, so a
-    failed send still counts (no retry floods).
+    failed send still counts (no retry floods). `cooldown` is the default; acquire() may pass its own.
     """
 
     def __init__(self, cooldown=60.0, hourly_cap=10, clock=time.monotonic):
         self.cooldown, self.hourly_cap, self.clock = cooldown, hourly_cap, clock
         self._lock = threading.Lock()
-        self._last = {}  # session id -> time of its last send
+        self._last = {}  # key -> (time of its last send, the cooldown it was sent with)
         self._sends = deque()  # times of all sends in the last hour
 
-    def acquire(self, session_id):
+    def acquire(self, session_id, cooldown=None):
         """(True, "ok") and record a send, or (False, reason) when rate limited."""
+        cooldown = self.cooldown if cooldown is None else cooldown
         with self._lock:
             now = self.clock()
             while self._sends and now - self._sends[0] >= 3600:
                 self._sends.popleft()
-            for sid in [s for s, t in self._last.items() if now - t >= self.cooldown]:
+            for sid in [s for s, (t, cd) in self._last.items() if now - t >= cd]:
                 del self._last[sid]  # keeps the dict small
             if session_id in self._last:
-                wait = self.cooldown - (now - self._last[session_id])
-                return False, f"wait {wait:.0f} s between alerts"
+                t, cd = self._last[session_id]
+                return False, f"wait {cd - (now - t):.0f} s between alerts"
             if len(self._sends) >= self.hourly_cap:
                 return False, f"hourly limit of {self.hourly_cap} reached"
-            self._last[session_id] = now
+            self._last[session_id] = (now, cooldown)
             self._sends.append(now)
             return True, "ok"
 
+
+def limit_setting(value, default, lo, hi):
+    """An optional numeric secret (TG_MAX_PER_HOUR, TG_COOLDOWN_SECONDS) as an int in lo..hi:
+    (value, True), or (default, False) when it is missing (None or blank) or not a whole number in range."""
+    if value is None or str(value).strip() == "":
+        return default, True
+    try:
+        n = float(str(value).strip())
+    except ValueError:
+        return default, False
+    if not n.is_integer() or not lo <= n <= hi:
+        return default, False
+    return int(n), True
 
 
 def code_matches(entered, expected):
