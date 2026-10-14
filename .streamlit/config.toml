@@ -1,0 +1,10 @@
+[server]
+maxUploadSize = 30  # MB; the app's own limits are tighter (photo 8 MB, video 25 MB)
+
+[client]
+showErrorDetails = "none"  # never show tracebacks to visitors; they go to the server log
+toolbarMode = "viewer"
+
+[theme]
+base = "dark"
+primaryColor = "#F5A623"
